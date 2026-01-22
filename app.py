@@ -19,6 +19,15 @@ def build_maps_search_url(query: str, location: str):
     encoded = urllib.parse.quote_plus(full_query)
     return f"https://www.google.com/maps/search/{encoded}"
 
+def safe_goto(page, url, timeout_ms=120000, retries=4):
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            return True
+        except:
+            time.sleep(2 + attempt)
+    return False
+
 def extract_place_links(page):
     cards = page.locator('a[href^="https://www.google.com/maps/place"]')
     links = []
@@ -28,13 +37,11 @@ def extract_place_links(page):
             links.append(href)
     return links
 
-def strict_scroll_until_end(page, mode: str, max_results: int, progress_callback=None):
-    delay = 1.4 if mode == "safe" else 0.6
-
+def strict_scroll_until_end(page, max_results: int, ui_status=None):
+    delay = 0.7
     stable_cycles = 0
-    stable_limit = 6
+    stable_limit = 10
     last_count = 0
-
     all_links = []
 
     while True:
@@ -45,8 +52,8 @@ def strict_scroll_until_end(page, mode: str, max_results: int, progress_callback
 
         current_count = len(all_links)
 
-        if progress_callback:
-            progress_callback(current_count)
+        if ui_status:
+            ui_status.write(f"Loaded links: {current_count}")
 
         if current_count >= max_results:
             return all_links[:max_results]
@@ -60,26 +67,13 @@ def strict_scroll_until_end(page, mode: str, max_results: int, progress_callback
         if stable_cycles >= stable_limit:
             return all_links
 
-        page.mouse.wheel(0, 5000)
+        page.mouse.wheel(0, 7000)
         time.sleep(delay)
 
-def scrape_place_details(page, link: str, mode: str):
-    per_place_delay = 2.0 if mode == "safe" else 0.8
-    goto_timeout = 180000 if mode == "safe" else 90000
+def scrape_place_details(page, link: str):
+    ok = safe_goto(page, link, timeout_ms=120000, retries=4)
 
-    def safe_goto(url):
-        # Retry 2 times
-        for _ in range(2):
-            try:
-                page.goto(url, timeout=goto_timeout, wait_until="domcontentloaded")
-                return True
-            except:
-                time.sleep(2)
-        return False
-
-    ok = safe_goto(link)
     if not ok:
-        # Return partial row instead of crashing whole scraping
         return {
             "name": "",
             "rating": "",
@@ -89,10 +83,10 @@ def scrape_place_details(page, link: str, mode: str):
             "full_address": "",
             "website": "",
             "google_maps_link": link,
-            "error": "goto_timeout"
+            "status": "failed_goto"
         }
 
-    time.sleep(per_place_delay)
+    time.sleep(1.5)
 
     title = ""
     rating = ""
@@ -103,7 +97,7 @@ def scrape_place_details(page, link: str, mode: str):
     category = ""
 
     try:
-        title = normalize_spaces(page.locator("h1").first.inner_text(timeout=5000))
+        title = normalize_spaces(page.locator("h1").first.inner_text(timeout=7000))
     except:
         title = ""
 
@@ -116,18 +110,19 @@ def scrape_place_details(page, link: str, mode: str):
 
     try:
         reviews_btn = page.locator('button[jsaction*="reviews"]').first
-        reviews_text = normalize_spaces(reviews_btn.inner_text(timeout=5000))
+        reviews_text = normalize_spaces(reviews_btn.inner_text(timeout=7000))
         nums = re.findall(r"[\d,]+", reviews_text)
         reviews = nums[0] if nums else ""
     except:
         reviews = ""
 
+    # Full details extraction (no fast mode)
     info_buttons = page.locator('button[data-item-id]')
     for i in range(info_buttons.count()):
         item = info_buttons.nth(i)
         data_id = item.get_attribute("data-item-id") or ""
         try:
-            txt = normalize_spaces(item.inner_text(timeout=2000))
+            txt = normalize_spaces(item.inner_text(timeout=3000))
         except:
             txt = ""
 
@@ -140,6 +135,8 @@ def scrape_place_details(page, link: str, mode: str):
         elif data_id == "category":
             category = txt
 
+    status = "ok" if title else "partial"
+
     return {
         "name": title,
         "rating": rating,
@@ -148,70 +145,71 @@ def scrape_place_details(page, link: str, mode: str):
         "industry": category,
         "full_address": address,
         "website": website,
-        "google_maps_link": link
+        "google_maps_link": link,
+        "status": status
     }
 
-def scrape_google_maps_strict(search_url: str, mode: str, max_results: int, ui_progress=None, ui_status=None):
-    results = []
+def scrape_google_maps_all(search_url: str, max_results: int, ui_progress=None, ui_status=None):
+    final_rows = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
 
-
-        if ui_status:
-            ui_status.write("Opening Google Maps search URL...")
-
-        page.goto(search_url, timeout=120000, wait_until="domcontentloaded")
-        time.sleep(3)
-
-        if ui_status:
-            ui_status.write("Scrolling results until end or limit reached...")
-
-        def progress_cb(count):
-            if ui_progress:
-                pct = min(count / max_results, 1.0)
-                ui_progress.progress(pct)
-            if ui_status:
-                ui_status.write(f"Loaded listings: {count}")
-
-        links = strict_scroll_until_end(
-            page=page,
-            mode=mode,
-            max_results=max_results,
-            progress_callback=progress_cb
+        # Speed improvement (safe): block heavy resources
+        page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ["image", "font", "media"]
+            else route.continue_()
         )
 
         if ui_status:
-            ui_status.write(f"Total unique listings collected: {len(links)}")
-            ui_status.write("Scraping place details...")
+            ui_status.write("Opening search page...")
+
+        ok = safe_goto(page, search_url, timeout_ms=150000, retries=4)
+        if not ok:
+            browser.close()
+            return []
+
+        time.sleep(2)
+
+        if ui_status:
+            ui_status.write("Scrolling results until end...")
+
+        links = strict_scroll_until_end(page, max_results=max_results, ui_status=ui_status)
+
+        if ui_status:
+            ui_status.write(f"Total links collected: {len(links)}")
+            ui_status.write("Scraping all place details...")
+
+        total = len(links)
 
         for idx, link in enumerate(links, start=1):
-            item = scrape_place_details(page, link, mode=mode)
-            results.append(item)
+            row = scrape_place_details(page, link)
+            final_rows.append(row)
 
             if ui_progress:
-                pct = min(idx / max_results, 1.0)
-                ui_progress.progress(pct)
+                ui_progress.progress(idx / total)
 
             if ui_status:
-                ui_status.write(f"Scraped details: {idx} / {len(links)}")
+                ui_status.write(f"Scraped {idx}/{total} | Status: {row.get('status')}")
+
+            # Small delay to reduce blocking
+            time.sleep(0.6)
 
         browser.close()
 
-    return results
+    return final_rows
 
 
 tab1, tab2 = st.tabs(["Agent Mode", "Search Query Mode"])
 
 with tab1:
     st.subheader("Agent Mode")
-
     query = st.text_input("Business Query", value="software company", key="agent_query")
     location = st.text_input("Location", value="Whitefield Bangalore", key="agent_location")
-    mode = st.selectbox("Mode", ["safe", "fast"], index=0, key="agent_mode")
-    max_results = st.slider("Max Results", 10, 300, 80, 10, key="agent_max_results")
+    max_results = st.slider("Max Results", 10, 1000, 200, 10, key="agent_max_results")
 
     start_agent = st.button("Start Scraping (Agent Mode)", key="agent_start")
 
@@ -223,41 +221,36 @@ with tab1:
         progress = st.progress(0.0)
         status = st.empty()
 
-        data = scrape_google_maps_strict(
+        data = scrape_google_maps_all(
             search_url=search_url,
-            mode=mode,
             max_results=max_results,
             ui_progress=progress,
             ui_status=status
         )
 
         if not data:
-            st.error("No results scraped. Try Safe mode or increase Max Results.")
+            st.error("No data scraped. Try again.")
         else:
             df = pd.DataFrame(data)
-            st.success(f"Scraped {len(df)} results")
+            st.success(f"Scraped total rows: {len(df)}")
             st.dataframe(df, use_container_width=True)
 
             st.download_button(
-                "Download CSV",
+                "Download CSV (All Rows)",
                 data=df.to_csv(index=False).encode("utf-8"),
-                file_name="google_maps_agent_results.csv",
+                file_name="google_maps_all_results.csv",
                 mime="text/csv"
             )
 
 with tab2:
     st.subheader("Search Query Mode")
-
-    st.write("Paste Google Maps Search URL and scrape until end automatically.")
-
     search_url_input = st.text_input(
         "Google Maps Search URL",
         value="https://www.google.com/maps/search/software+company+in+whitefield",
         key="search_url_mode"
     )
 
-    mode2 = st.selectbox("Mode", ["safe", "fast"], index=0, key="search_mode")
-    max_results2 = st.slider("Max Results", 10, 1000, 200, 10, key="search_max_results")
+    max_results2 = st.slider("Max Results", 10, 2000, 300, 10, key="search_max_results")
 
     start_search = st.button("Start Scraping (Search Query Mode)", key="search_start")
 
@@ -271,38 +264,23 @@ with tab2:
             progress2 = st.progress(0.0)
             status2 = st.empty()
 
-            data2 = scrape_google_maps_strict(
+            data2 = scrape_google_maps_all(
                 search_url=search_url_input.strip(),
-                mode=mode2,
                 max_results=max_results2,
                 ui_progress=progress2,
                 ui_status=status2
             )
 
             if not data2:
-                st.error("No results scraped. Try Safe mode and increase Max Results.")
+                st.error("No data scraped. Try again.")
             else:
                 df2 = pd.DataFrame(data2)
-                st.success(f"Scraped {len(df2)} results")
+                st.success(f"Scraped total rows: {len(df2)}")
                 st.dataframe(df2, use_container_width=True)
 
                 st.download_button(
-                    "Download CSV",
+                    "Download CSV (All Rows)",
                     data=df2.to_csv(index=False).encode("utf-8"),
-                    file_name="google_maps_search_query_results.csv",
+                    file_name="google_maps_all_results.csv",
                     mime="text/csv"
-                )
-
-                st.download_button(
-                    "Download TSV",
-                    data=df2.to_csv(index=False, sep="\t").encode("utf-8"),
-                    file_name="google_maps_search_query_results.tsv",
-                    mime="text/tab-separated-values"
-                )
-
-                st.download_button(
-                    "Download JSON",
-                    data=json.dumps(data2, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name="google_maps_search_query_results.json",
-                    mime="application/json"
                 )
