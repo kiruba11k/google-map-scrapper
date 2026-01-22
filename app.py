@@ -64,9 +64,34 @@ def strict_scroll_until_end(page, mode: str, max_results: int, progress_callback
         time.sleep(delay)
 
 def scrape_place_details(page, link: str, mode: str):
-    per_place_delay = 2.4 if mode == "safe" else 1.1
+    per_place_delay = 2.0 if mode == "safe" else 0.8
+    goto_timeout = 180000 if mode == "safe" else 90000
 
-    page.goto(link, timeout=90000)
+    def safe_goto(url):
+        # Retry 2 times
+        for _ in range(2):
+            try:
+                page.goto(url, timeout=goto_timeout, wait_until="domcontentloaded")
+                return True
+            except:
+                time.sleep(2)
+        return False
+
+    ok = safe_goto(link)
+    if not ok:
+        # Return partial row instead of crashing whole scraping
+        return {
+            "name": "",
+            "rating": "",
+            "reviews": "",
+            "phone": "",
+            "industry": "",
+            "full_address": "",
+            "website": "",
+            "google_maps_link": link,
+            "error": "goto_timeout"
+        }
+
     time.sleep(per_place_delay)
 
     title = ""
@@ -78,7 +103,7 @@ def scrape_place_details(page, link: str, mode: str):
     category = ""
 
     try:
-        title = normalize_spaces(page.locator("h1").first.inner_text())
+        title = normalize_spaces(page.locator("h1").first.inner_text(timeout=5000))
     except:
         title = ""
 
@@ -91,7 +116,7 @@ def scrape_place_details(page, link: str, mode: str):
 
     try:
         reviews_btn = page.locator('button[jsaction*="reviews"]').first
-        reviews_text = normalize_spaces(reviews_btn.inner_text())
+        reviews_text = normalize_spaces(reviews_btn.inner_text(timeout=5000))
         nums = re.findall(r"[\d,]+", reviews_text)
         reviews = nums[0] if nums else ""
     except:
@@ -102,7 +127,7 @@ def scrape_place_details(page, link: str, mode: str):
         item = info_buttons.nth(i)
         data_id = item.get_attribute("data-item-id") or ""
         try:
-            txt = normalize_spaces(item.inner_text())
+            txt = normalize_spaces(item.inner_text(timeout=2000))
         except:
             txt = ""
 
@@ -132,11 +157,13 @@ def scrape_google_maps_strict(search_url: str, mode: str, max_results: int, ui_p
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
+        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media"] else route.continue_())
+
 
         if ui_status:
             ui_status.write("Opening Google Maps search URL...")
 
-        page.goto(search_url, timeout=90000)
+        page.goto(search_url, timeout=120000, wait_until="domcontentloaded")
         time.sleep(3)
 
         if ui_status:
