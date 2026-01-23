@@ -1,8 +1,33 @@
+import os
 import time
 import re
+import math
+import urllib.parse
 import pandas as pd
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+st.set_page_config(page_title="Google Maps Scraper", layout="wide")
+st.title("Google Maps Scraper")
+
+# -----------------------------
+# Checkpoint Helpers
+# -----------------------------
+CHECKPOINT_FILE = "checkpoint_results.csv"
+
+def save_checkpoint(df: pd.DataFrame):
+    try:
+        df.to_csv(CHECKPOINT_FILE, index=False)
+    except:
+        pass
+
+def load_checkpoint():
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            return pd.read_csv(CHECKPOINT_FILE)
+    except:
+        pass
+    return pd.DataFrame()
 
 # -----------------------------
 # Helpers
@@ -10,8 +35,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 def clean_text(x):
     if not x:
         return ""
-    x = re.sub(r"\s+", " ", str(x)).strip()
-    return x
+    return re.sub(r"\s+", " ", str(x)).strip()
 
 def safe_float(x):
     try:
@@ -28,68 +52,58 @@ def safe_int(x):
 def normalize_maps_url(url: str) -> str:
     if not url:
         return ""
-    # Remove tracking params if any
     return url.split("&")[0]
 
-def extract_phone(text: str):
-    if not text:
-        return ""
-    # simple phone pattern for India / international
-    m = re.search(r"(\+?\d[\d\s\-()]{7,}\d)", text)
-    return clean_text(m.group(1)) if m else ""
+def build_search_url(query: str):
+    query = query.strip()
+    encoded = urllib.parse.quote_plus(query)
+    return f"https://www.google.com/maps/search/{encoded}"
 
-def extract_website(text: str):
-    if not text:
-        return ""
-    # detect website-like strings
-    m = re.search(r"(https?://[^\s]+)", text)
-    return clean_text(m.group(1)) if m else ""
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371
+    p = math.pi / 180
+    dlat = (lat2 - lat1) * p
+    dlon = (lon2 - lon1) * p
+    a = (math.sin(dlat / 2) ** 2) + math.cos(lat1 * p) * math.cos(lat2 * p) * (math.sin(dlon / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(a))
 
 # -----------------------------
 # VERY FAST MODE (Cards Only)
 # -----------------------------
-def scrape_cards_only(search_url, max_results=100, scroll_pause=1.2, ui_status=None):
+def scrape_cards_only(search_url, max_results=200, scroll_pause=1.0, ui_status=None, ui_progress=None):
     rows = []
     seen_links = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(locale="en-US")
         page = context.new_page()
-
         page.set_default_timeout(90000)
 
         if ui_status:
             ui_status.info("Opening Google Maps search page...")
-
         page.goto(search_url, wait_until="domcontentloaded")
 
-        # Wait for results panel
         try:
             page.wait_for_selector('div[role="feed"]', timeout=60000)
         except:
             if ui_status:
-                ui_status.warning("Could not detect results feed. Trying anyway...")
+                ui_status.warning("Results feed not detected, trying anyway...")
 
-        feed_selector = 'div[role="feed"]'
-        feed = page.locator(feed_selector)
+        feed = page.locator('div[role="feed"]').first
 
-        # Scroll to load more
         last_count = 0
-        same_count_rounds = 0
+        stable_rounds = 0
+        stable_limit = 6
 
         if ui_status:
-            ui_status.info("Scrolling to load results...")
+            ui_status.info("Scrolling until no new results appear...")
 
         while True:
-            cards = page.locator('a.hfpxzc')  # place links inside cards
+            cards = page.locator("a.hfpxzc")
             count = cards.count()
 
             if ui_status:
@@ -99,73 +113,65 @@ def scrape_cards_only(search_url, max_results=100, scroll_pause=1.2, ui_status=N
                 break
 
             if count == last_count:
-                same_count_rounds += 1
+                stable_rounds += 1
             else:
-                same_count_rounds = 0
+                stable_rounds = 0
 
-            if same_count_rounds >= 4:
+            if stable_rounds >= stable_limit:
                 break
 
             last_count = count
 
-            # Scroll feed
             try:
                 feed.evaluate("(el) => el.scrollBy(0, el.scrollHeight)")
             except:
-                page.mouse.wheel(0, 3000)
+                page.mouse.wheel(0, 5000)
 
             time.sleep(scroll_pause)
 
-        # Extract each card details
-        cards = page.locator('a.hfpxzc')
+        cards = page.locator("a.hfpxzc")
         total = min(cards.count(), max_results)
 
         if ui_status:
             ui_status.success(f"Card scraped: {total}/{total}")
 
         for i in range(total):
+            if ui_progress:
+                ui_progress.progress((i + 1) / total)
+
             try:
                 card = cards.nth(i)
-                link = card.get_attribute("href") or ""
-                link = normalize_maps_url(link)
-
+                link = normalize_maps_url(card.get_attribute("href") or "")
                 if not link or link in seen_links:
                     continue
                 seen_links.add(link)
 
-                # Card container is usually parent element
                 container = card.locator("xpath=ancestor::div[contains(@class,'Nv2PK')]").first
 
                 name = ""
-                rating = ""
-                reviews = ""
+                rating = None
+                reviews = None
                 category = ""
                 address_snippet = ""
 
-                # Name
                 try:
                     name = container.locator("div.qBF1Pd").first.inner_text(timeout=2000)
                 except:
-                    try:
-                        name = card.get_attribute("aria-label") or ""
-                    except:
-                        name = ""
+                    name = card.get_attribute("aria-label") or ""
 
-                # Rating + reviews
                 try:
-                    rating = container.locator("span.MW4etd").first.inner_text(timeout=2000)
+                    rating_txt = container.locator("span.MW4etd").first.inner_text(timeout=2000)
+                    rating = safe_float(rating_txt)
                 except:
-                    rating = ""
+                    rating = None
 
                 try:
-                    reviews = container.locator("span.UY7F9").first.inner_text(timeout=2000)
-                    reviews = reviews.replace("(", "").replace(")", "")
+                    rev_txt = container.locator("span.UY7F9").first.inner_text(timeout=2000)
+                    reviews = safe_int(rev_txt)
                 except:
-                    reviews = ""
+                    reviews = None
 
-                # Category + address snippet line
                 try:
-                    # This line often contains: "Coaching center · Address..."
                     line = container.locator("div.W4Efsd").nth(1).inner_text(timeout=2000)
                     line = clean_text(line)
                     if "·" in line:
@@ -183,8 +189,8 @@ def scrape_cards_only(search_url, max_results=100, scroll_pause=1.2, ui_status=N
                 rows.append(
                     {
                         "name": clean_text(name),
-                        "rating": safe_float(rating),
-                        "reviews": safe_int(reviews),
+                        "rating": rating,
+                        "reviews": reviews,
                         "phone": "",
                         "industry": clean_text(category),
                         "full_address": clean_text(address_snippet),
@@ -193,6 +199,11 @@ def scrape_cards_only(search_url, max_results=100, scroll_pause=1.2, ui_status=N
                         "status": "ok_card",
                     }
                 )
+
+                # Auto-save every 20 rows
+                if len(rows) % 20 == 0:
+                    temp_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
+                    save_checkpoint(temp_df)
 
             except Exception as e:
                 rows.append(
@@ -211,81 +222,64 @@ def scrape_cards_only(search_url, max_results=100, scroll_pause=1.2, ui_status=N
 
         browser.close()
 
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["google_maps_link"], keep="first")
-    return df
+    final_df = pd.DataFrame(rows)
+    final_df = final_df.drop_duplicates(subset=["google_maps_link"], keep="first")
+    save_checkpoint(final_df)
+    return final_df
 
 # -----------------------------
-# DEEP SCRAPE MODE (Open Each Place)
+# DEEP SCRAPE MODE
 # -----------------------------
 def scrape_place_details(page, place_url, retries=2):
     place_url = normalize_maps_url(place_url)
-    if not place_url:
-        return {
-            "name": "",
-            "rating": None,
-            "reviews": None,
-            "phone": "",
-            "industry": "",
-            "full_address": "",
-            "website": "",
-            "google_maps_link": "",
-            "status": "missing_url",
-        }
 
     for attempt in range(retries + 1):
         try:
             page.goto(place_url, wait_until="domcontentloaded", timeout=120000)
             time.sleep(1.2)
 
-            # Name
             name = ""
+            rating = None
+            reviews = None
+            phone = ""
+            industry = ""
+            full_address = ""
+            website = ""
+
             try:
                 name = page.locator("h1.DUwDvf").first.inner_text(timeout=8000)
             except:
                 name = ""
 
-            # Rating
-            rating = None
             try:
                 rating_txt = page.locator("div.F7nice span.ceNzKf").first.inner_text(timeout=4000)
                 rating = safe_float(rating_txt)
             except:
                 rating = None
 
-            # Reviews count
-            reviews = None
             try:
                 rev_txt = page.locator("div.F7nice span:nth-child(2)").first.inner_text(timeout=4000)
                 reviews = safe_int(rev_txt)
             except:
                 reviews = None
 
-            # Category
-            industry = ""
             try:
                 industry = page.locator("button.DkEaL").first.inner_text(timeout=4000)
             except:
                 industry = ""
 
-            # Full address
-            full_address = ""
             try:
                 full_address = page.locator('button[data-item-id="address"]').first.inner_text(timeout=4000)
             except:
                 full_address = ""
 
-            # Phone
-            phone = ""
             try:
                 phone = page.locator('button[data-item-id^="phone"]').first.inner_text(timeout=4000)
             except:
                 phone = ""
 
-            # Website
-            website = ""
             try:
-                website = page.locator('a[data-item-id="authority"]').first.get_attribute("href")
+                website = page.locator('a[data-item-id="authority"]').first.get_attribute("href") or ""
             except:
                 website = ""
 
@@ -316,21 +310,8 @@ def scrape_place_details(page, place_url, retries=2):
                 "google_maps_link": place_url,
                 "status": "timeout_place",
             }
-        except Exception as e:
-            return {
-                "name": "",
-                "rating": None,
-                "reviews": None,
-                "phone": "",
-                "industry": "",
-                "full_address": "",
-                "website": "",
-                "google_maps_link": place_url,
-                "status": f"error_place: {str(e)[:120]}",
-            }
 
-def scrape_deep(search_url, max_results=50, scroll_pause=1.2, ui_status=None):
-    # Step 1: Get all place links quickly from cards
+def scrape_deep(search_url, max_results=200, scroll_pause=1.0, ui_status=None, ui_progress=None):
     cards_df = scrape_cards_only(
         search_url=search_url,
         max_results=max_results,
@@ -339,17 +320,13 @@ def scrape_deep(search_url, max_results=50, scroll_pause=1.2, ui_status=None):
     )
 
     links = [x for x in cards_df["google_maps_link"].tolist() if x]
-    links = list(dict.fromkeys(links))  # unique preserve order
+    links = list(dict.fromkeys(links))
 
     rows = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(locale="en-US")
         page = context.new_page()
@@ -360,103 +337,136 @@ def scrape_deep(search_url, max_results=50, scroll_pause=1.2, ui_status=None):
             if ui_status:
                 ui_status.write(f"Scraping details: {idx} / {total}")
 
+            if ui_progress:
+                ui_progress.progress(idx / total)
+
             item = scrape_place_details(page, link, retries=2)
             rows.append(item)
 
-            # small delay to reduce blocking
+            # Auto-save every 10 rows
+            if len(rows) % 10 == 0:
+                temp_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
+                save_checkpoint(temp_df)
+
             time.sleep(0.6)
 
         browser.close()
 
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["google_maps_link"], keep="first")
-    return df
+    final_df = pd.DataFrame(rows)
+    final_df = final_df.drop_duplicates(subset=["google_maps_link"], keep="first")
+    save_checkpoint(final_df)
+    return final_df
 
 # -----------------------------
-# STREAMLIT UI
+# UI TABS
 # -----------------------------
-st.set_page_config(page_title="Google Maps Scraper", layout="wide")
+tab1, tab2 = st.tabs(["POI Radius Scraper", "Search Query Scraper"])
 
-st.title(" Google Maps Scraper (Render Ready)")
-st.caption("2 Modes: Very Fast (Cards) + Deep Scrape (Open each place)")
+# TAB 1: POI Radius
+with tab1:
+    st.subheader("POI Radius Scraper")
 
-search_url_input = st.text_input(
-    "Paste Google Maps Search URL",
-    value="https://www.google.com/maps/search/jee+mains+coaching+centres+in+india/",
-)
+    poi_auto = st.checkbox("Auto-detect POI keywords", value=True)
+    manual_poi = st.text_input(
+        "Custom POI Keywords (comma separated)",
+        value="coaching centre, tuition centre, institute, training center",
+    )
 
-col1, col2, col3 = st.columns(3)
+    lat = st.number_input("Latitude", value=12.971600, format="%.6f")
+    lon = st.number_input("Longitude", value=77.594600, format="%.6f")
+    radius_km = st.number_input("Radius (KM)", value=3.0, min_value=0.5, max_value=50.0, step=0.5)
 
-with col1:
-    mode = st.selectbox("Scrape Mode", ["Very Fast (Cards)", "Deep Scrape (Accurate)"])
+    max_results = st.number_input("Max Results Per POI", min_value=10, max_value=5000, value=200, step=10)
+    scroll_delay = st.slider("Scroll Delay", 0.5, 5.0, 1.0, 0.1)
 
-with col2:
-    max_results = st.number_input("Max Results", min_value=1, max_value=5000, value=100)
+    mode = st.selectbox("Scrape Mode", ["Very Fast (Cards)", "Deep Scrape (Full Details)"], key="poi_mode")
 
-with col3:
-    scroll_pause = st.slider("Scroll Delay (seconds)", min_value=0.5, max_value=5.0, value=1.2, step=0.1)
+    if st.button("Start POI Radius Scrape"):
+        status_box = st.empty()
+        progress_box = st.progress(0.0)
 
-status_box = st.empty()
-
-if st.button(" Start Scraping"):
-    if not search_url_input.strip():
-        st.error("Please paste a valid Google Maps Search URL.")
-        st.stop()
-
-    status_box.info("Starting scrape...")
-
-    try:
-        if mode == "Very Fast (Cards)":
-            df = scrape_cards_only(
-                search_url=search_url_input.strip(),
-                max_results=int(max_results),
-                scroll_pause=float(scroll_pause),
-                ui_status=status_box,
-            )
+        if poi_auto:
+            poi_list = ["coaching centre", "tuition centre", "training institute", "academy", "institute"]
         else:
-            df = scrape_deep(
-                search_url=search_url_input.strip(),
-                max_results=int(max_results),
-                scroll_pause=float(scroll_pause),
-                ui_status=status_box,
-            )
+            poi_list = [x.strip() for x in manual_poi.split(",") if x.strip()]
 
-        if df.empty:
-            st.warning("No data found. Try increasing scroll delay or max results.")
-            st.stop()
+        all_dfs = []
 
-        # reorder columns
-        cols = [
-            "name",
-            "rating",
-            "reviews",
-            "phone",
-            "industry",
-            "full_address",
-            "website",
-            "google_maps_link",
-            "status",
-        ]
-        for c in cols:
-            if c not in df.columns:
-                df[c] = ""
+        for idx, poi in enumerate(poi_list, start=1):
+            status_box.info(f"Scraping POI: {poi} ({idx}/{len(poi_list)})")
 
-        df = df[cols]
+            query = f"{poi} near {lat},{lon}"
+            url = build_search_url(query)
 
-        st.success(f" Scraped rows: {len(df)}")
-        st.dataframe(df, use_container_width=True)
+            if mode == "Very Fast (Cards)":
+                df = scrape_cards_only(url, max_results=max_results, scroll_pause=scroll_delay, ui_status=status_box, ui_progress=progress_box)
+            else:
+                df = scrape_deep(url, max_results=max_results, scroll_pause=scroll_delay, ui_status=status_box, ui_progress=progress_box)
 
-        # TSV output
-        tsv_data = df.to_csv(sep="\t", index=False)
+            df["poi_keyword"] = poi
+            all_dfs.append(df)
+
+        final_df = pd.concat(all_dfs, ignore_index=True)
+        final_df = final_df.drop_duplicates(subset=["google_maps_link"], keep="first")
+
+        st.success(f"Total unique rows scraped: {len(final_df)}")
+        st.dataframe(final_df, use_container_width=True)
+
         st.download_button(
-            " Download TSV",
-            data=tsv_data,
-            file_name="google_maps_results.tsv",
-            mime="text/tab-separated-values",
+            "Download CSV",
+            data=final_df.to_csv(index=False).encode("utf-8"),
+            file_name="poi_radius_results.csv",
+            mime="text/csv",
         )
 
-        status_box.success("Done ")
+# TAB 2: Search Query
+with tab2:
+    st.subheader("Search Query Scraper")
 
-    except Exception as e:
-        st.error(f"Scraping failed: {e}")
-        status_box.error("Failed ")
+    search_url = st.text_input(
+        "Google Maps Search URL",
+        value="https://www.google.com/maps/search/jee+mains+coaching+centres+in+india/",
+    )
+
+    max_results2 = st.number_input("Max Results", min_value=10, max_value=5000, value=200, step=10)
+    scroll_delay2 = st.slider("Scroll Delay (seconds)", 0.5, 5.0, 1.0, 0.1)
+
+    mode2 = st.selectbox("Scrape Mode", ["Very Fast (Cards)", "Deep Scrape (Full Details)"], key="search_mode")
+
+    if st.button("Start Search Scrape"):
+        status_box2 = st.empty()
+        progress_box2 = st.progress(0.0)
+
+        if mode2 == "Very Fast (Cards)":
+            df2 = scrape_cards_only(search_url, max_results=max_results2, scroll_pause=scroll_delay2, ui_status=status_box2, ui_progress=progress_box2)
+        else:
+            df2 = scrape_deep(search_url, max_results=max_results2, scroll_pause=scroll_delay2, ui_status=status_box2, ui_progress=progress_box2)
+
+        st.success(f"Scraped rows: {len(df2)}")
+        st.dataframe(df2, use_container_width=True)
+
+        st.download_button(
+            "Download CSV",
+            data=df2.to_csv(index=False).encode("utf-8"),
+            file_name="search_query_results.csv",
+            mime="text/csv",
+        )
+
+# -----------------------------
+# Recovery Section
+# -----------------------------
+st.divider()
+st.subheader("Recovery / Auto-Saved Data")
+
+checkpoint_df = load_checkpoint()
+
+if not checkpoint_df.empty:
+    st.success(f"Recovered saved rows: {len(checkpoint_df)}")
+    st.download_button(
+        "Download Last Auto-Saved CSV",
+        data=checkpoint_df.to_csv(index=False).encode("utf-8"),
+        file_name="checkpoint_results.csv",
+        mime="text/csv",
+    )
+else:
+    st.info("No checkpoint saved yet.")
