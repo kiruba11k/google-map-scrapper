@@ -19,7 +19,7 @@ def build_maps_search_url(query: str, location: str):
     encoded = urllib.parse.quote_plus(full_query)
     return f"https://www.google.com/maps/search/{encoded}"
 
-def safe_goto(page, url, timeout_ms=120000, retries=3):
+def safe_goto(page, url, timeout_ms=150000, retries=3):
     for attempt in range(1, retries + 1):
         try:
             page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
@@ -28,26 +28,32 @@ def safe_goto(page, url, timeout_ms=120000, retries=3):
             time.sleep(1.5 + attempt)
     return False
 
-def scroll_until_end(page, max_results: int, ui_status=None):
-    delay = 0.5
+def get_results_panel(page):
+    # Left panel results container
+    return page.locator('div[role="feed"]').first
+
+def collect_unique_place_links_strict(page, max_results: int, ui_status=None):
+    panel = get_results_panel(page)
+
+    all_links = set()
     stable_cycles = 0
-    stable_limit = 10
+    stable_limit = 12
     last_count = 0
-    all_links = []
 
     while True:
-        links = extract_place_links(page)
-        for l in links:
-            if l not in all_links:
-                all_links.append(l)
+        cards = page.locator('a[href^="https://www.google.com/maps/place"]')
+        for i in range(cards.count()):
+            href = cards.nth(i).get_attribute("href")
+            if href:
+                all_links.add(href)
 
         current_count = len(all_links)
 
         if ui_status:
-            ui_status.write(f"Loaded cards: {current_count}")
+            ui_status.write(f"Collected unique places: {current_count}")
 
         if current_count >= max_results:
-            return all_links[:max_results]
+            return list(all_links)[:max_results]
 
         if current_count == last_count:
             stable_cycles += 1
@@ -55,91 +61,85 @@ def scroll_until_end(page, max_results: int, ui_status=None):
             stable_cycles = 0
             last_count = current_count
 
+        # Stop when no new places appear
         if stable_cycles >= stable_limit:
-            return all_links
+            return list(all_links)
 
-        page.mouse.wheel(0, 7000)
-        time.sleep(delay)
+        # Scroll inside results panel (IMPORTANT)
+        try:
+            panel.evaluate("(el) => { el.scrollBy(0, 7000); }")
+        except:
+            page.mouse.wheel(0, 7000)
 
-def extract_place_links(page):
-    cards = page.locator('a[href^="https://www.google.com/maps/place"]')
-    links = []
-    for i in range(cards.count()):
-        href = cards.nth(i).get_attribute("href")
-        if href and href not in links:
-            links.append(href)
-    return links
+        time.sleep(0.8)
 
-def extract_cards_data_from_results(page):
+def extract_card_data_by_link(page, link):
     """
     Very Fast mode:
-    Scrape directly from visible result cards without opening each place.
+    Extract data from results card HTML for a specific place link.
     """
-    cards = page.locator('a[href^="https://www.google.com/maps/place"]')
-    rows = []
+    name = rating = reviews = address = category = ""
+    phone = ""
+    website = ""
 
-    for i in range(cards.count()):
-        href = cards.nth(i).get_attribute("href")
-        if not href:
-            continue
-
-        # container card
-        container = cards.nth(i).locator(
-            "xpath=ancestor::div[contains(@jsaction,'mouseover:pane')]"
-        ).first
-
-        name = rating = reviews = address = category = ""
-
-        try:
-            name = normalize_spaces(container.locator(".fontHeadlineSmall").first.inner_text(timeout=1000))
-        except:
-            name = ""
-
-        try:
-            aria = container.locator('[role="img"]').first.get_attribute("aria-label")
-            if aria and "stars" in aria:
-                rating = aria.split(" ")[0]
-                parts = aria.split()
-                if len(parts) >= 3:
-                    reviews = parts[2].replace("(", "").replace(")", "")
-        except:
-            rating, reviews = "", ""
-
-        # category + address are mixed in card text
-        try:
-            text_blob = normalize_spaces(container.inner_text(timeout=1000))
-            # usually category appears after rating/reviews
-            # address often contains digits
-            addr_match = re.search(r"\d+[^|•\n]+", text_blob)
-            if addr_match:
-                address = normalize_spaces(addr_match.group(0))
-        except:
-            address = ""
-
-        rows.append({
-            "name": name,
-            "rating": rating,
-            "reviews": reviews,
+    try:
+        card = page.locator(f'a[href="{link}"]').first
+        container = card.locator("xpath=ancestor::div[contains(@jsaction,'mouseover:pane')]").first
+    except:
+        return {
+            "name": "",
+            "rating": "",
+            "reviews": "",
             "phone": "",
-            "industry": category,
-            "full_address": address,
+            "industry": "",
+            "full_address": "",
             "website": "",
-            "google_maps_link": href,
-            "status": "ok_card"
-        })
+            "google_maps_link": link,
+            "status": "card_not_found"
+        }
 
-    # Deduplicate by link
-    unique = {}
-    for r in rows:
-        unique[r["google_maps_link"]] = r
-    return list(unique.values())
+    try:
+        name = normalize_spaces(container.locator(".fontHeadlineSmall").first.inner_text(timeout=1500))
+    except:
+        name = ""
+
+    try:
+        aria = container.locator('[role="img"]').first.get_attribute("aria-label")
+        if aria and "stars" in aria:
+            rating = aria.split(" ")[0]
+            parts = aria.split()
+            if len(parts) >= 3:
+                reviews = parts[2].replace("(", "").replace(")", "")
+    except:
+        rating, reviews = "", ""
+
+    # Try to parse address from card text blob (best effort)
+    try:
+        blob = normalize_spaces(container.inner_text(timeout=1500))
+        addr_match = re.search(r"\d+[^|•\n]+", blob)
+        if addr_match:
+            address = normalize_spaces(addr_match.group(0))
+    except:
+        address = ""
+
+    return {
+        "name": name,
+        "rating": rating,
+        "reviews": reviews,
+        "phone": phone,
+        "industry": category,
+        "full_address": address,
+        "website": website,
+        "google_maps_link": link,
+        "status": "ok_card"
+    }
 
 def scrape_place_details(page, link: str):
     """
     Deep mode:
-    Open each place link and extract full details.
+    Open each place and extract full details.
     """
-    ok = safe_goto(page, link, timeout_ms=120000, retries=3)
+    ok = safe_goto(page, link, timeout_ms=150000, retries=3)
     if not ok:
         return {
             "name": "",
@@ -158,7 +158,7 @@ def scrape_place_details(page, link: str):
     title = rating = reviews = address = website = phone = category = ""
 
     try:
-        title = normalize_spaces(page.locator("h1").first.inner_text(timeout=7000))
+        title = normalize_spaces(page.locator("h1").first.inner_text(timeout=8000))
     except:
         title = ""
 
@@ -171,7 +171,7 @@ def scrape_place_details(page, link: str):
 
     try:
         reviews_btn = page.locator('button[jsaction*="reviews"]').first
-        reviews_text = normalize_spaces(reviews_btn.inner_text(timeout=7000))
+        reviews_text = normalize_spaces(reviews_btn.inner_text(timeout=8000))
         nums = re.findall(r"[\d,]+", reviews_text)
         reviews = nums[0] if nums else ""
     except:
@@ -182,7 +182,7 @@ def scrape_place_details(page, link: str):
         item = info_buttons.nth(i)
         data_id = item.get_attribute("data-item-id") or ""
         try:
-            txt = normalize_spaces(item.inner_text(timeout=3000))
+            txt = normalize_spaces(item.inner_text(timeout=4000))
         except:
             txt = ""
 
@@ -226,7 +226,7 @@ def run_scraper(search_url: str, max_results: int, mode: str, ui_progress=None, 
         if ui_status:
             ui_status.write("Opening Google Maps search page...")
 
-        ok = safe_goto(page, search_url, timeout_ms=150000, retries=3)
+        ok = safe_goto(page, search_url, timeout_ms=180000, retries=3)
         if not ok:
             browser.close()
             return []
@@ -234,33 +234,39 @@ def run_scraper(search_url: str, max_results: int, mode: str, ui_progress=None, 
         time.sleep(2)
 
         if ui_status:
-            ui_status.write("Scrolling results until end...")
+            ui_status.write("Scrolling results until no new places appear...")
 
-        scroll_until_end(page, max_results=max_results, ui_status=ui_status)
+        links = collect_unique_place_links_strict(page, max_results=max_results, ui_status=ui_status)
+
+        if not links:
+            browser.close()
+            return []
+
+        total = len(links)
 
         if mode == "very_fast":
             if ui_status:
-                ui_status.write("Extracting data from cards (Very Fast)...")
+                ui_status.write(f"Very Fast mode: extracting card data for {total} places...")
 
-            rows = extract_cards_data_from_results(page)
-            rows = rows[:max_results]
+            rows = []
+            for idx, link in enumerate(links, start=1):
+                row = extract_card_data_by_link(page, link)
+                rows.append(row)
+
+                if ui_progress:
+                    ui_progress.progress(idx / total)
+
+                if ui_status:
+                    ui_status.write(f"Card scraped: {idx}/{total}")
 
             browser.close()
             return rows
 
         # Deep mode
         if ui_status:
-            ui_status.write("Collecting place links for Deep Scrape...")
-
-        links = extract_place_links(page)
-        links = links[:max_results]
+            ui_status.write(f"Deep mode: scraping full details for {total} places...")
 
         results = []
-        total = len(links)
-
-        if ui_status:
-            ui_status.write(f"Deep scraping {total} places...")
-
         for idx, link in enumerate(links, start=1):
             row = scrape_place_details(page, link)
             results.append(row)
@@ -269,7 +275,7 @@ def run_scraper(search_url: str, max_results: int, mode: str, ui_progress=None, 
                 ui_progress.progress(idx / total)
 
             if ui_status:
-                ui_status.write(f"Scraped {idx}/{total}")
+                ui_status.write(f"Scraped details: {idx}/{total}")
 
         browser.close()
         return results
@@ -279,16 +285,17 @@ tab1, tab2 = st.tabs(["Agent Mode", "Search Query Mode"])
 
 with tab1:
     st.subheader("Agent Mode")
+
     query = st.text_input("Business Query", value="software company")
     location = st.text_input("Location", value="Whitefield Bangalore")
-    max_results = st.slider("Max Results", 10, 1000, 200, 10)
+    max_results = st.slider("Max Results", 10, 2000, 200, 10)
 
     scrape_mode = st.selectbox("Scrape Mode", ["Very Fast (Cards)", "Deep Scrape (Full Details)"])
-
     start_agent = st.button("Start Scraping")
 
     if start_agent:
         search_url = build_maps_search_url(query=query, location=location)
+
         st.write("Generated Search URL:")
         st.code(search_url)
 
@@ -318,12 +325,13 @@ with tab1:
 
 with tab2:
     st.subheader("Search Query Mode")
+
     search_url_input = st.text_input(
         "Google Maps Search URL",
         value="https://www.google.com/maps/search/software+company+in+whitefield"
     )
 
-    max_results2 = st.slider("Max Results (Search Mode)", 10, 2000, 300, 10)
+    max_results2 = st.slider("Max Results (Search Mode)", 10, 5000, 300, 10)
 
     scrape_mode2 = st.selectbox(
         "Scrape Mode (Search Mode)",
