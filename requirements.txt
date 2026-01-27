@@ -1,3 +1,7 @@
-streamlit
+Flask
+Flask-CORS
 pandas
 playwright
+redis
+Werkzeug
+gunicorn
