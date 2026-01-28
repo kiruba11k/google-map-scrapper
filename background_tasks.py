@@ -254,3 +254,56 @@ class TaskManager:
 def create_scraping_task(task_id, config):
     """Factory function to create scraping tasks"""
     return ScrapingTask(task_id, config)
+
+# Add to background_tasks.py
+import asyncio
+from playwright.async_api import async_playwright
+
+class RealGoogleMapsScraper:
+    def __init__(self, task_id):
+        self.task_id = task_id
+        self.checkpoint_file = f"temp/checkpoint_{task_id}.csv"
+    
+    async def scrape_cards(self, search_url, max_results=50):
+        """Actual Playwright scraping"""
+        results = []
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            try:
+                await page.goto(search_url, wait_until='networkidle')
+                
+                # Scroll and collect results
+                for i in range(max_results // 10):
+                    # Extract results
+                    cards = await page.query_selector_all('a.hfpxzc')
+                    for card in cards:
+                        try:
+                            name = await card.get_attribute('aria-label') or ''
+                            href = await card.get_attribute('href') or ''
+                            
+                            results.append({
+                                'name': name,
+                                'google_maps_link': href,
+                                'status': 'scraped'
+                            })
+                        except:
+                            continue
+                    
+                    # Scroll down
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    await asyncio.sleep(1)
+                
+                await browser.close()
+                return results
+                
+            except Exception as e:
+                await browser.close()
+                raise e
