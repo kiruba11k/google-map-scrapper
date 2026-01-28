@@ -6,7 +6,7 @@ import urllib.parse
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Optional
-
+import threading
 # Optimized scraping logic
 class OptimizedScraper:
     def __init__(self, base_dir, temp_dir, checkpoint_file):
