@@ -97,16 +97,36 @@ def get_task_status(task_id):
 def download_results(task_id):
     """Download results as CSV"""
     try:
+        # First check if task is still active
         task = task_manager.get_task(task_id)
-        if not task:
-            return jsonify({'error': 'Task not found'}), 404
         
-        results_file = task.get_results_file()
+        if task:
+            # Task is still in memory, get results file from task
+            results_file = task.get_results_file()
+        else:
+            # Task might be completed and cleaned up, check for saved files
+            results_file = f"temp/results_{task_id}.csv"
+        
         if not results_file or not os.path.exists(results_file):
-            return jsonify({'error': 'Results not available'}), 404
+            # Also check for checkpoint file as fallback
+            if os.path.exists('checkpoint_results.csv'):
+                results_file = 'checkpoint_results.csv'
+            else:
+                # Check for any CSV in temp directory with task_id
+                import glob
+                temp_files = glob.glob(f"temp/*{task_id}*.csv")
+                if temp_files:
+                    results_file = temp_files[0]
+                else:
+                    return jsonify({'error': 'Results not available. Task may have failed or not completed.'}), 404
         
         # Create a downloadable filename
         filename = f"maps_scraped_{task_id[:8]}.csv"
+        
+        # Ensure the file is readable
+        if not os.access(results_file, os.R_OK):
+            return jsonify({'error': 'Results file is not accessible'}), 500
+            
         return send_file(
             results_file,
             as_attachment=True,
@@ -115,8 +135,9 @@ def download_results(task_id):
         )
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
+        print(f"Download error: {e}")  # Debug logging
+        return jsonify({'error': f'Download failed: {str(e)}'}), 500
+        
 @app.route('/api/stop_task/<task_id>', methods=['POST'])
 def stop_task(task_id):
     """Stop a running task"""
