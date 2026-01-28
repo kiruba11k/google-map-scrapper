@@ -322,7 +322,7 @@ def scrape_cards_only(self, search_url, max_results=200, scroll_pause=1.0):
         return pd.DataFrame()
 
 
-    def scrape_cards_only_direct(self, search_url, max_results=200, scroll_pause=1.0):
+def scrape_cards_only_direct(self, search_url, max_results=200, scroll_pause=1.0):
     """Direct scraping using the exact HTML structure from the example"""
     print(f"Starting direct scraping for: {search_url}")
     
