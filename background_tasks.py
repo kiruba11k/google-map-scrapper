@@ -452,7 +452,7 @@ def scrape_cards_only_direct(self, search_url, max_results=200, scroll_pause=1.0
 
 
 
-    def debug_page_structure(self, search_url):
+def debug_page_structure(self, search_url):
     """Debug function to see what's actually on the page"""
     print(f"Debugging page: {search_url}")
     
