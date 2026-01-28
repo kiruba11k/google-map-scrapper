@@ -63,7 +63,10 @@ class ScrapingTask:
         self.scraper = OptimizedScraper()
         self._stop_flag = False
         
-        # Create task-specific results file
+        # Create temp directory if not exists
+        os.makedirs('temp', exist_ok=True)
+        
+        # Create task-specific results file path
         self.results_file = f"temp/results_{task_id}.csv"
         
     def run(self):
@@ -71,65 +74,120 @@ class ScrapingTask:
         try:
             self.status = "running"
             self.start_time = datetime.now()
+            self.message = "Starting scraping task..."
+            
+            # Initialize results DataFrame
+            results_data = []
             
             if self.config['task_type'] == 'poi':
-                self._run_poi_scraping()
+                results = self._run_poi_scraping_simulation()
             elif self.config['task_type'] == 'search':
-                self._run_search_scraping()
+                results = self._run_search_scraping_simulation()
             else:
                 raise ValueError(f"Unknown task type: {self.config['task_type']}")
-                
-            if not self._stop_flag:
+            
+            # Convert results to DataFrame
+            results_df = pd.DataFrame(results)
+            self.total_results = len(results_df)
+            
+            if not self._stop_flag and not results_df.empty:
+                # Save results to file
+                results_df.to_csv(self.results_file, index=False)
                 self.status = "completed"
                 self.progress = 1.0
                 self.message = f"Task completed with {self.total_results} results"
+                
+                # Also update checkpoint
+                self.scraper.save_checkpoint(results_df)
+            else:
+                if self._stop_flag:
+                    self.status = "stopped"
+                    self.message = "Task stopped by user"
+                else:
+                    self.status = "completed"
+                    self.message = "Task completed but no results found"
+                    
         except Exception as e:
+            print(f"Task error: {e}")  # Debug logging
             self.status = "failed"
-            self.message = f"Error: {str(e)}"
-        finally:
-            # Cleanup if stopped
-            if self._stop_flag:
-                self.status = "stopped"
-                self.message = "Task stopped by user"
+            self.message = f"Error: {str(e)[:100]}"
+            
+            # Create empty results file to prevent download errors
+            empty_df = pd.DataFrame(columns=['name', 'rating', 'reviews', 'phone', 'industry', 
+                                             'full_address', 'website', 'google_maps_link', 'status'])
+            empty_df.to_csv(self.results_file, index=False)
     
-    def _run_poi_scraping(self):
-        """Run POI radius scraping"""
-        # Implementation of your POI scraping logic
-        # This would use Playwright similarly to your original code
-        # but optimized for background processing
+    def _run_poi_scraping_simulation(self):
+        """Simulate POI scraping - replace with actual implementation"""
+        self.message = "Starting POI scraping simulation..."
+        results = []
         
-        # Placeholder implementation
-        self.message = "Starting POI scraping..."
-        
-        # Simulate progress for demo
+        # Simulate scraping 100 results
         for i in range(1, 101):
             if self._stop_flag:
                 break
-            time.sleep(0.1)  # Simulated work
-            self.progress = i / 100
-            self.message = f"Scraping... {i}%"
             
-        self.total_results = 100  # Placeholder
+            time.sleep(0.05)  # Simulated work
+            
+            # Update progress
+            self.progress = i / 100
+            self.message = f"Scraping POI result {i}/100"
+            
+            # Add simulated data
+            results.append({
+                'name': f'Business {i}',
+                'rating': round(3.5 + (i % 50) / 10, 1),
+                'reviews': 10 + (i * 5) % 500,
+                'phone': f'555-{1000+i:04d}',
+                'industry': 'Education',
+                'full_address': f'{i} Main St, City {i}',
+                'website': f'https://business{i}.com',
+                'google_maps_link': f'https://maps.google.com/?q=business{i}',
+                'status': 'ok'
+            })
+            
+            # Periodically save checkpoint
+            if i % 20 == 0:
+                temp_df = pd.DataFrame(results)
+                self.scraper.save_checkpoint(temp_df)
+        
+        return results
     
-    def _run_search_scraping(self):
-        """Run search query scraping"""
-        # Implementation of your search scraping logic
+    def _run_search_scraping_simulation(self):
+        """Simulate search scraping - replace with actual implementation"""
+        self.message = "Starting search scraping simulation..."
+        results = []
         
-        self.message = "Starting search scraping..."
-        
-        # Simulate progress for demo
-        for i in range(1, 101):
+        # Simulate scraping 150 results
+        for i in range(1, 151):
             if self._stop_flag:
                 break
-            time.sleep(0.1)  # Simulated work
-            self.progress = i / 100
-            self.message = f"Scraping... {i}%"
             
-        self.total_results = 150  # Placeholder
-    
-    def stop(self):
-        """Stop the task"""
-        self._stop_flag = True
+            time.sleep(0.03)  # Simulated work
+            
+            # Update progress
+            self.progress = i / 150
+            self.message = f"Scraping search result {i}/150"
+            
+            # Add simulated data
+            results.append({
+                'name': f'Search Result {i}',
+                'rating': round(4.0 + (i % 40) / 10, 1),
+                'reviews': 20 + (i * 3) % 1000,
+                'phone': f'555-{2000+i:04d}',
+                'industry': 'Training Institute',
+                'full_address': f'{i+100} Search Ave, City {i}',
+                'website': f'https://searchresult{i}.com',
+                'google_maps_link': f'https://maps.google.com/?q=searchresult{i}',
+                'status': 'ok'
+            })
+            
+            # Periodically save checkpoint
+            if i % 25 == 0:
+                temp_df = pd.DataFrame(results)
+                self.scraper.save_checkpoint(temp_df)
+        
+        return results
     
     def get_status(self):
         """Get current task status"""
@@ -140,12 +198,12 @@ class ScrapingTask:
             'message': self.message,
             'started_at': self.start_time.isoformat() if self.start_time else None,
             'total_results': self.total_results,
-            'results_file': self.results_file
+            'results_file': self.results_file if os.path.exists(self.results_file) else None
         }
     
     def get_results_file(self):
         """Get path to results file"""
-        if os.path.exists(self.results_file):
+        if self.results_file and os.path.exists(self.results_file):
             return self.results_file
         return None
 
