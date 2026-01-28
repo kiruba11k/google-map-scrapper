@@ -1,41 +1,33 @@
 import os
 import json
 import uuid
-import time
 import threading
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, session
 from flask_cors import CORS
 import pandas as pd
 from werkzeug.utils import secure_filename
-import redis
-import pickle
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SESSION_SECRET", "dev-secret-key-change-in-production")
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_PERMANENT'] = False
-CORS(app)
 
-# Redis for session storage (if available, fallback to file system)
-try:
-    redis_url = os.environ.get("REDIS_URL")
-    if redis_url:
-        redis_client = redis.from_url(redis_url)
-        print("Connected to Redis")
-    else:
-        redis_client = None
-        print("Using file-based session storage")
-except:
-    redis_client = None
+# Set environment variables for Render
+os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/tmp/ms-playwright'
+os.environ['PLAYWRIGHT_DOWNLOAD_HOST'] = 'https://playwright.azureedge.net'
+
+# Set base directory for files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BASE_DIR, 'temp')
+CHECKPOINT_FILE = os.path.join(BASE_DIR, 'checkpoint_results.csv')
+
+# Create directories if they don't exist
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs('/tmp/ms-playwright', exist_ok=True)
 
 # Import background task manager
 from background_tasks import TaskManager, create_scraping_task
 
-task_manager = TaskManager()
-
-# Create temp directory if not exists
-os.makedirs('temp', exist_ok=True)
+task_manager = TaskManager(BASE_DIR, TEMP_DIR, CHECKPOINT_FILE)
 
 @app.route('/')
 def index():
@@ -52,14 +44,8 @@ def start_scraping():
         # Generate unique task ID
         task_id = str(uuid.uuid4())
         
-        # Store task configuration
-        if redis_client:
-            redis_client.set(f"task_config_{task_id}", json.dumps(data), ex=86400)  # 24h expiry
-        else:
-            session[f"task_config_{task_id}"] = data
-        
         # Create and start task
-        task = create_scraping_task(task_id, data)
+        task = create_scraping_task(task_id, data, BASE_DIR, TEMP_DIR, CHECKPOINT_FILE)
         task_manager.add_task(task_id, task)
         
         # Start task in background thread
@@ -74,6 +60,7 @@ def start_scraping():
         })
         
     except Exception as e:
+        print(f"Start scraping error: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
