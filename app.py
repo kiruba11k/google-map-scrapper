@@ -87,25 +87,31 @@ def download_results(task_id):
         # First check if task is still active
         task = task_manager.get_task(task_id)
         
+        results_file = None
+        
         if task:
             # Task is still in memory, get results file from task
             results_file = task.get_results_file()
-        else:
-            # Task might be completed and cleaned up, check for saved files
-            results_file = f"temp/results_{task_id}.csv"
         
+        # If not found in task, check in temp directory
         if not results_file or not os.path.exists(results_file):
-            # Also check for checkpoint file as fallback
-            if os.path.exists('checkpoint_results.csv'):
-                results_file = 'checkpoint_results.csv'
+            results_file = os.path.join(TEMP_DIR, f"results_{task_id}.csv")
+        
+        if not os.path.exists(results_file):
+            # Check for checkpoint file as fallback
+            if os.path.exists(CHECKPOINT_FILE):
+                results_file = CHECKPOINT_FILE
             else:
                 # Check for any CSV in temp directory with task_id
                 import glob
-                temp_files = glob.glob(f"temp/*{task_id}*.csv")
+                temp_files = glob.glob(os.path.join(TEMP_DIR, f"*{task_id}*.csv"))
                 if temp_files:
                     results_file = temp_files[0]
                 else:
-                    return jsonify({'error': 'Results not available. Task may have failed or not completed.'}), 404
+                    return jsonify({
+                        'error': 'Results not available yet. Task may still be running or failed.',
+                        'task_status': task.get_status() if task else 'No task found'
+                    }), 404
         
         # Create a downloadable filename
         filename = f"maps_scraped_{task_id[:8]}.csv"
@@ -125,6 +131,7 @@ def download_results(task_id):
         print(f"Download error: {e}")  # Debug logging
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
         
+
 @app.route('/api/stop_task/<task_id>', methods=['POST'])
 def stop_task(task_id):
     """Stop a running task"""
