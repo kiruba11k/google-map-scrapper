@@ -151,23 +151,52 @@ def stop_task(task_id):
 def get_checkpoint():
     """Get checkpoint data if exists"""
     try:
-        if os.path.exists('checkpoint_results.csv'):
-            df = pd.read_csv('checkpoint_results.csv')
+        # Check multiple possible checkpoint locations
+        checkpoint_files = [
+            'checkpoint_results.csv',
+            'temp/checkpoint_results.csv',
+            'checkpoint.csv'
+        ]
+        
+        for filepath in checkpoint_files:
+            if os.path.exists(filepath):
+                df = pd.read_csv(filepath)
+                if not df.empty:
+                    return jsonify({
+                        'success': True,
+                        'data': df.head(100).to_dict('records'),
+                        'total_rows': len(df),
+                        'file': filepath
+                    })
+        
+        # Also check for any CSV in temp directory
+        import glob
+        temp_files = glob.glob("temp/*.csv")
+        if temp_files:
+            # Get the most recent file
+            latest_file = max(temp_files, key=os.path.getctime)
+            df = pd.read_csv(latest_file)
             return jsonify({
                 'success': True,
-                'data': df.head(100).to_dict('records'),  # First 100 rows
-                'total_rows': len(df)
+                'data': df.head(100).to_dict('records'),
+                'total_rows': len(df),
+                'file': latest_file
             })
+        
         return jsonify({
             'success': True,
             'data': [],
-            'total_rows': 0
+            'total_rows': 0,
+            'message': 'No checkpoint data found'
         })
+        
     except Exception as e:
+        print(f"Checkpoint error: {e}")  # Debug logging
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+        
 
 @app.route('/api/clear_checkpoint', methods=['POST'])
 def clear_checkpoint():
