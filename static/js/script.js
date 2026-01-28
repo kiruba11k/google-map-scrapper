@@ -231,12 +231,13 @@ function stopTask(taskId, taskType) {
 
 function showDownloadButton(taskId, resultCount, taskType) {
     const buttonHtml = `
-        <div class="alert alert-success mt-3">
+        <div class="alert alert-success mt-3" id="download-section-${taskId}">
             <h6><i class="fas fa-check-circle me-2"></i>Task Completed!</h6>
             <p>Scraped ${resultCount} results.</p>
-            <a href="/api/download_results/${taskId}" class="btn btn-primary">
+            <button class="btn btn-primary" onclick="downloadResults('${taskId}')">
                 <i class="fas fa-download me-1"></i>Download CSV
-            </a>
+            </button>
+            <div id="download-status-${taskId}" class="mt-2 small"></div>
         </div>
     `;
     
@@ -247,6 +248,69 @@ function showDownloadButton(taskId, resultCount, taskType) {
     }
 }
 
+function downloadResults(taskId) {
+    const statusDiv = $(`#download-status-${taskId}`);
+    statusDiv.html('<i class="fas fa-spinner fa-spin me-1"></i> Preparing download...');
+    
+    // Create a hidden iframe for download
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = `/api/download_results/${taskId}`;
+    document.body.appendChild(iframe);
+    
+    // Check if download started
+    setTimeout(() => {
+        statusDiv.html('<i class="fas fa-check me-1 text-success"></i> Download started. Check your browser downloads.');
+    }, 1000);
+    
+    // Alternative method using fetch
+    /*
+    fetch(`/api/download_results/${taskId}`)
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Download failed');
+            }
+            return response.blob();
+        })
+        .then(blob => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `maps_scraped_${taskId.substring(0, 8)}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            statusDiv.html('<i class="fas fa-check me-1 text-success"></i> Download complete!');
+        })
+        .catch(error => {
+            statusDiv.html(`<i class="fas fa-times me-1 text-danger"></i> ${error.message}`);
+        });
+    */
+}
+
+// Add this to the pollTaskStatus function when task completes:
+if (status.status === 'completed') {
+    clearInterval(taskPollingIntervals[taskId]);
+    delete taskPollingIntervals[taskId];
+    delete activeTasks[taskId];
+    
+    // Update badge
+    updateActiveTasksBadge();
+    
+    // Show download button immediately
+    showDownloadButton(taskId, status.total_results, taskType);
+    
+    // Also create a direct download link
+    setTimeout(() => {
+        downloadResults(taskId);
+    }, 1000);
+    
+    // Reload recovery data
+    loadRecoveryData();
+    
+    showNotification('Task completed successfully!', 'success');
+}
 function loadRecoveryData() {
     $.ajax({
         url: '/api/get_checkpoint',
