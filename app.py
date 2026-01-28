@@ -227,6 +227,45 @@ def get_active_tasks():
     
     return jsonify({'tasks': task_list})
 
+@app.route('/api/debug_tasks')
+def debug_tasks():
+    """Debug endpoint to see all files and tasks"""
+    import glob
+    import json
+    
+    debug_info = {
+        'active_tasks': {},
+        'temp_files': [],
+        'checkpoint_files': []
+    }
+    
+    # Active tasks
+    tasks = task_manager.get_all_tasks()
+    for task_id, task in tasks.items():
+        debug_info['active_tasks'][task_id] = {
+            'status': task.status,
+            'results_file': task.results_file,
+            'file_exists': os.path.exists(task.results_file) if task.results_file else False
+        }
+    
+    # Temp files
+    debug_info['temp_files'] = glob.glob("temp/*")
+    
+    # Checkpoint files
+    checkpoint_files = []
+    for file in ['checkpoint_results.csv', 'checkpoint.csv', 'results.csv']:
+        if os.path.exists(file):
+            checkpoint_files.append({
+                'name': file,
+                'size': os.path.getsize(file),
+                'exists': True
+            })
+    
+    debug_info['checkpoint_files'] = checkpoint_files
+    
+    return jsonify(debug_info)
+    
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
