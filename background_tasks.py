@@ -7,6 +7,8 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, Optional
 import threading
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 # Optimized scraping logic
 class OptimizedScraper:
     def __init__(self, base_dir, temp_dir, checkpoint_file):
@@ -58,18 +60,59 @@ class OptimizedScraper:
             return ""
         return url.split("&")[0]
 
-class RealGoogleMapsScraper(OptimizedScraper):
-    def __init__(self, task):
-        super().__init__()
+class RealGoogleMapsScraper:
+    def __init__(self, task, base_dir, temp_dir, checkpoint_file):
         self.task = task
         self.task_id = task.task_id
+        self.base_dir = base_dir
+        self.temp_dir = temp_dir
+        self.checkpoint_file = checkpoint_file
         
+    def clean_text(self, text):
+        if not text:
+            return ""
+        return re.sub(r'\s+', ' ', str(text)).strip()
+    
+    def safe_float(self, text):
+        try:
+            return float(str(text).strip())
+        except:
+            return None
+    
+    def safe_int(self, text):
+        try:
+            return int(re.sub(r'[^\d]', '', str(text)))
+        except:
+            return None
+    
+    def save_checkpoint(self, df):
+        """Save checkpoint with minimal I/O"""
+        try:
+            # Append to existing checkpoint to minimize writes
+            if os.path.exists(self.checkpoint_file):
+                existing = pd.read_csv(self.checkpoint_file)
+                df = pd.concat([existing, df], ignore_index=True)
+                df = df.drop_duplicates(subset=['google_maps_link'], keep='last')
+            df.to_csv(self.checkpoint_file, index=False)
+            print(f"Checkpoint saved: {self.checkpoint_file}, rows: {len(df)}")
+        except Exception as e:
+            print(f"Checkpoint save error: {e}")
+    
+    def normalize_maps_url(self, url):
+        """Normalize Google Maps URL"""
+        if not url:
+            return ""
+        return url.split("&")[0]
+    
     def scrape_cards_only(self, search_url, max_results=200, scroll_pause=1.0):
         """Actual card scraping from your original code"""
         rows = []
         seen_links = set()
         
         try:
+            self.task.message = "Launching browser..."
+            print("Launching Playwright browser...")
+            
             with sync_playwright() as p:
                 browser = p.chromium.launch(
                     headless=True,
@@ -80,12 +123,14 @@ class RealGoogleMapsScraper(OptimizedScraper):
                 page.set_default_timeout(90000)
                 
                 self.task.message = "Opening Google Maps search page..."
+                print(f"Navigating to: {search_url}")
                 page.goto(search_url, wait_until="domcontentloaded")
                 
                 try:
                     page.wait_for_selector('div[role="feed"]', timeout=60000)
+                    self.task.message = "Results feed detected, starting to scroll..."
                 except:
-                    self.task.message = "Results feed not detected, trying anyway..."
+                    self.task.message = "Results feed not detected, trying to find results anyway..."
                 
                 feed = page.locator('div[role="feed"]').first
                 
@@ -93,7 +138,7 @@ class RealGoogleMapsScraper(OptimizedScraper):
                 stable_rounds = 0
                 stable_limit = 6
                 
-                self.task.message = "Scrolling until no new results appear..."
+                self.task.message = "Scrolling to load more results..."
                 
                 # Track scroll progress
                 scroll_iterations = 0
@@ -108,9 +153,10 @@ class RealGoogleMapsScraper(OptimizedScraper):
                     count = cards.count()
                     
                     self.task.message = f"Loaded cards: {count}"
-                    self.task.progress = min(0.4, count / max_results * 0.4)  # 40% for scrolling
+                    self.task.progress = min(0.4, count / max_results * 0.4)
                     
                     if count >= max_results:
+                        self.task.message = f"Reached max results: {max_results}"
                         break
                     
                     if count == last_count:
@@ -119,6 +165,7 @@ class RealGoogleMapsScraper(OptimizedScraper):
                         stable_rounds = 0
                     
                     if stable_rounds >= stable_limit:
+                        self.task.message = f"No new results for {stable_limit} scrolls, stopping..."
                         break
                     
                     last_count = count
@@ -135,6 +182,7 @@ class RealGoogleMapsScraper(OptimizedScraper):
                 total = min(cards.count(), max_results)
                 
                 self.task.message = f"Extracting data from {total} cards..."
+                print(f"Found {total} cards to scrape")
                 
                 for i in range(total):
                     if self.task._stop_flag:
@@ -146,50 +194,65 @@ class RealGoogleMapsScraper(OptimizedScraper):
                     
                     try:
                         card = cards.nth(i)
-                        link = self.normalize_maps_url(card.get_attribute("href") or "")
+                        link = card.get_attribute("href") or ""
+                        link = self.normalize_maps_url(link)
+                        
                         if not link or link in seen_links:
                             continue
                         seen_links.add(link)
                         
-                        container = card.locator("xpath=ancestor::div[contains(@class,'Nv2PK')]").first
-                        
+                        # Try to get the name
                         name = ""
+                        try:
+                            name = card.get_attribute("aria-label") or ""
+                        except:
+                            pass
+                        
+                        # Try to get more details from the card
                         rating = None
                         reviews = None
                         category = ""
                         address_snippet = ""
                         
                         try:
-                            name = container.locator("div.qBF1Pd").first.inner_text(timeout=2000)
-                        except:
-                            name = card.get_attribute("aria-label") or ""
-                        
-                        try:
-                            rating_txt = container.locator("span.MW4etd").first.inner_text(timeout=2000)
-                            rating = self.safe_float(rating_txt)
-                        except:
-                            rating = None
-                        
-                        try:
-                            rev_txt = container.locator("span.UY7F9").first.inner_text(timeout=2000)
-                            reviews = self.safe_int(rev_txt)
-                        except:
-                            reviews = None
-                        
-                        try:
-                            line = container.locator("div.W4Efsd").nth(1).inner_text(timeout=2000)
-                            line = self.clean_text(line)
-                            if "·" in line:
-                                parts = [p.strip() for p in line.split("·") if p.strip()]
-                                if len(parts) >= 1:
-                                    category = parts[0]
-                                if len(parts) >= 2:
-                                    address_snippet = parts[1]
-                            else:
-                                category = line
-                        except:
-                            category = ""
-                            address_snippet = ""
+                            # Get the card container
+                            card_container = card.locator("xpath=ancestor::div[contains(@class, 'Nv2PK')]").first
+                            
+                            # Try to get rating
+                            try:
+                                rating_elem = card_container.locator("span.MW4etd").first
+                                rating_text = rating_elem.inner_text(timeout=1000)
+                                rating = self.safe_float(rating_text)
+                            except:
+                                pass
+                            
+                            # Try to get reviews
+                            try:
+                                reviews_elem = card_container.locator("span.UY7F9").first
+                                reviews_text = reviews_elem.inner_text(timeout=1000)
+                                reviews = self.safe_int(reviews_text)
+                            except:
+                                pass
+                            
+                            # Try to get category and address
+                            try:
+                                details_line = card_container.locator("div.W4Efsd").nth(1)
+                                details_text = details_line.inner_text(timeout=1000)
+                                details_text = self.clean_text(details_text)
+                                
+                                if "·" in details_text:
+                                    parts = [p.strip() for p in details_text.split("·") if p.strip()]
+                                    if len(parts) >= 1:
+                                        category = parts[0]
+                                    if len(parts) >= 2:
+                                        address_snippet = parts[1]
+                                else:
+                                    category = details_text
+                            except:
+                                pass
+                                
+                        except Exception as e:
+                            print(f"Error extracting card details: {e}")
                         
                         rows.append(
                             {
@@ -205,13 +268,15 @@ class RealGoogleMapsScraper(OptimizedScraper):
                             }
                         )
                         
-                        # Auto-save every 20 rows
-                        if len(rows) % 20 == 0:
-                            temp_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
+                        # Auto-save every 10 rows
+                        if len(rows) % 10 == 0:
+                            temp_df = pd.DataFrame(rows)
                             self.save_checkpoint(temp_df)
                             self.task.message = f"Saved {len(rows)} results so far..."
+                            print(f"Saved {len(rows)} results to checkpoint")
                         
                     except Exception as e:
+                        print(f"Error processing card {i}: {e}")
                         rows.append(
                             {
                                 "name": "",
@@ -222,30 +287,104 @@ class RealGoogleMapsScraper(OptimizedScraper):
                                 "full_address": "",
                                 "website": "",
                                 "google_maps_link": "",
-                                "status": f"error_card: {str(e)[:120]}",
+                                "status": f"error: {str(e)[:100]}",
                             }
                         )
                 
                 browser.close()
             
-            final_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
+            final_df = pd.DataFrame(rows)
+            if not final_df.empty:
+                final_df = final_df.drop_duplicates(subset=["google_maps_link"], keep="first")
+            
             self.save_checkpoint(final_df)
-            self.task.message = f"Card scraping complete: {len(final_df)} results"
+            self.task.message = f"Card scraping complete: {len(final_df)} real results"
+            print(f"Scraping completed. Total results: {len(final_df)}")
             
             return final_df
             
         except Exception as e:
             self.task.message = f"Error in card scraping: {str(e)[:200]}"
+            print(f"Scraping error: {e}")
             raise e
     
-    def scrape_place_details(self, page, place_url, retries=2):
+    def scrape_deep(self, search_url, max_results=200, scroll_pause=1.0):
+        """Deep scraping - cards + place details"""
+        # Step 1: collect links fast
+        self.task.message = "Step 1: Collecting place links..."
+        cards_df = self.scrape_cards_only(
+            search_url=search_url,
+            max_results=max_results,
+            scroll_pause=scroll_pause,
+        )
+        
+        if cards_df.empty:
+            self.task.message = "No links found to scrape details"
+            return cards_df
+        
+        links = [x for x in cards_df["google_maps_link"].tolist() if x]
+        links = list(dict.fromkeys(links))
+        
+        if not links:
+            return cards_df
+        
+        rows = []
+        self.task.message = f"Step 2: Scraping details from {len(links)} places..."
+        print(f"Starting deep scrape of {len(links)} places")
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(locale="en-US")
+            page = context.new_page()
+            page.set_default_timeout(120000)
+            
+            total = len(links)
+            for idx, link in enumerate(links, start=1):
+                if self.task._stop_flag:
+                    self.task.message = "Stopping deep scraping..."
+                    break
+                
+                # Update progress (50% to 100% for details)
+                self.task.progress = 0.5 + (idx / total * 0.5)
+                self.task.message = f"Scraping details: {idx} / {total}"
+                
+                # Scrape individual place
+                item = self._scrape_place_details(page, link)
+                rows.append(item)
+                
+                # Auto-save every 5 rows
+                if len(rows) % 5 == 0:
+                    temp_df = pd.DataFrame(rows)
+                    self.save_checkpoint(temp_df)
+                    self.task.message = f"Saved {len(rows)} detailed results..."
+                
+                time.sleep(1)  # Be respectful with requests
+            
+            browser.close()
+        
+        # Combine results
+        if rows:
+            detailed_df = pd.DataFrame(rows)
+            final_df = pd.concat([cards_df, detailed_df]).drop_duplicates(subset=["google_maps_link"], keep="last")
+        else:
+            final_df = cards_df
+        
+        self.save_checkpoint(final_df)
+        self.task.message = f"Deep scraping complete: {len(final_df)} results"
+        
+        return final_df
+    
+    def _scrape_place_details(self, page, place_url, retries=2):
         """Scrape individual place details"""
         place_url = self.normalize_maps_url(place_url)
         
         for attempt in range(retries + 1):
             try:
-                page.goto(place_url, wait_until="domcontentloaded", timeout=120000)
-                time.sleep(1.2)
+                page.goto(place_url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(2)  # Wait for page to load
                 
                 name = ""
                 rating = None
@@ -255,42 +394,60 @@ class RealGoogleMapsScraper(OptimizedScraper):
                 full_address = ""
                 website = ""
                 
+                # Try to get name
                 try:
-                    name = page.locator("h1.DUwDvf").first.inner_text(timeout=8000)
+                    name_elem = page.locator("h1.DUwDvf").first
+                    name = name_elem.inner_text(timeout=5000)
                 except:
-                    name = ""
+                    try:
+                        name_elem = page.locator("h1.fontHeadlineLarge").first
+                        name = name_elem.inner_text(timeout=5000)
+                    except:
+                        pass
                 
+                # Try to get rating
                 try:
-                    rating_txt = page.locator("div.F7nice span.ceNzKf").first.inner_text(timeout=4000)
-                    rating = self.safe_float(rating_txt)
+                    rating_elem = page.locator("div.F7nice span.ceNzKf").first
+                    rating_text = rating_elem.inner_text(timeout=3000)
+                    rating = self.safe_float(rating_text)
                 except:
-                    rating = None
+                    pass
                 
+                # Try to get reviews
                 try:
-                    rev_txt = page.locator("div.F7nice span:nth-child(2)").first.inner_text(timeout=4000)
-                    reviews = self.safe_int(rev_txt)
+                    reviews_elem = page.locator("div.F7nice span:nth-child(2)").first
+                    reviews_text = reviews_elem.inner_text(timeout=3000)
+                    reviews = self.safe_int(reviews_text)
                 except:
-                    reviews = None
+                    pass
                 
+                # Try to get industry/category
                 try:
-                    industry = page.locator("button.DkEaL").first.inner_text(timeout=4000)
+                    industry_elem = page.locator("button.DkEaL").first
+                    industry = industry_elem.inner_text(timeout=3000)
                 except:
-                    industry = ""
+                    pass
                 
+                # Try to get address
                 try:
-                    full_address = page.locator('button[data-item-id="address"]').first.inner_text(timeout=4000)
+                    address_elem = page.locator('button[data-item-id="address"]').first
+                    full_address = address_elem.inner_text(timeout=3000)
                 except:
-                    full_address = ""
+                    pass
                 
+                # Try to get phone
                 try:
-                    phone = page.locator('button[data-item-id^="phone"]').first.inner_text(timeout=4000)
+                    phone_elem = page.locator('button[data-item-id^="phone"]').first
+                    phone = phone_elem.inner_text(timeout=3000)
                 except:
-                    phone = ""
+                    pass
                 
+                # Try to get website
                 try:
-                    website = page.locator('a[data-item-id="authority"]').first.get_attribute("href") or ""
+                    website_elem = page.locator('a[data-item-id="authority"]').first
+                    website = website_elem.get_attribute("href") or ""
                 except:
-                    website = ""
+                    pass
                 
                 return {
                     "name": self.clean_text(name),
@@ -317,71 +474,23 @@ class RealGoogleMapsScraper(OptimizedScraper):
                     "full_address": "",
                     "website": "",
                     "google_maps_link": place_url,
-                    "status": "timeout_place",
+                    "status": "timeout",
                 }
-    
-    def scrape_deep(self, search_url, max_results=200, scroll_pause=1.0):
-        """Deep scraping - cards + place details"""
-        # Step 1: collect links fast (50% progress)
-        self.task.message = "Step 1: Collecting place links..."
-        cards_df = self.scrape_cards_only(
-            search_url=search_url,
-            max_results=max_results,
-            scroll_pause=scroll_pause,
-        )
-        
-        links = [x for x in cards_df["google_maps_link"].tolist() if x]
-        links = list(dict.fromkeys(links))
-        
-        if not links:
-            self.task.message = "No links found to scrape details"
-            return cards_df
-        
-        rows = []
-        self.task.message = f"Step 2: Scraping details from {len(links)} places..."
-        
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            context = browser.new_context(locale="en-US")
-            page = context.new_page()
-            page.set_default_timeout(120000)
-            
-            total = len(links)
-            for idx, link in enumerate(links, start=1):
-                if self.task._stop_flag:
-                    self.task.message = "Stopping deep scraping..."
-                    break
-                
-                # Update progress (50% to 100% for details)
-                self.task.progress = 0.5 + (idx / total * 0.5)
-                self.task.message = f"Scraping details: {idx} / {total}"
-                
-                item = self.scrape_place_details(page, link, retries=2)
-                rows.append(item)
-                
-                # Auto-save every 10 rows
-                if len(rows) % 10 == 0:
-                    temp_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
-                    self.save_checkpoint(temp_df)
-                    self.task.message = f"Saved {len(rows)} detailed results..."
-                
-                time.sleep(0.6)
-            
-            browser.close()
-        
-        # Combine card data with detailed data
-        detailed_df = pd.DataFrame(rows).drop_duplicates(subset=["google_maps_link"], keep="first")
-        
-        # Update card data with detailed info where available
-        final_df = pd.concat([cards_df, detailed_df]).drop_duplicates(subset=["google_maps_link"], keep="last")
-        
-        self.save_checkpoint(final_df)
-        self.task.message = f"Deep scraping complete: {len(final_df)} results"
-        
-        return final_df
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(2)
+                    continue
+                return {
+                    "name": "",
+                    "rating": None,
+                    "reviews": None,
+                    "phone": "",
+                    "industry": "",
+                    "full_address": "",
+                    "website": "",
+                    "google_maps_link": place_url,
+                    "status": f"error: {str(e)[:100]}",
+                }
 
 class ScrapingTask:
     def __init__(self, task_id, config, base_dir, temp_dir, checkpoint_file):
@@ -396,44 +505,61 @@ class ScrapingTask:
         self.results_file = None
         self.start_time = None
         self.total_results = 0
-        self.scraper = OptimizedScraper(base_dir, temp_dir, checkpoint_file)
+        self.scraper = None  # Will be initialized in run()
         self._stop_flag = False
         
         # Create task-specific results file path
         self.results_file = os.path.join(self.temp_dir, f"results_{task_id}.csv")
         
     def run(self):
-        """Main task execution method"""
+        """Main task execution method - NOW USING REAL SCRAPING"""
         try:
             self.status = "running"
             self.start_time = datetime.now()
             
+            # Initialize REAL scraper (not simulation)
+            self.scraper = RealGoogleMapsScraper(self, self.base_dir, self.temp_dir, self.checkpoint_file)
+            
             if self.config['task_type'] == 'poi':
-                self._run_poi_scraping()
+                results_df = self._run_poi_scraping_real()
             elif self.config['task_type'] == 'search':
-                self._run_search_scraping()
+                results_df = self._run_search_scraping_real()
             else:
                 raise ValueError(f"Unknown task type: {self.config['task_type']}")
-                
+            
+            self.total_results = len(results_df) if not results_df.empty else 0
+            
             if not self._stop_flag:
-                self.status = "completed"
-                self.progress = 1.0
-                self.message = f"Task completed with {self.total_results} results"
-                print(f"Task {self.task_id} completed successfully")
+                # Save results to file
+                if not results_df.empty:
+                    results_df.to_csv(self.results_file, index=False)
+                    self.status = "completed"
+                    self.progress = 1.0
+                    self.message = f"Task completed with {self.total_results} REAL results"
+                    print(f"Task {self.task_id} completed successfully with {self.total_results} results")
+                else:
+                    self.status = "completed"
+                    self.progress = 1.0
+                    self.message = "Task completed but no results found"
+                    print(f"Task {self.task_id} completed with no results")
+            else:
+                self.status = "stopped"
+                self.message = "Task stopped by user"
+                    
         except Exception as e:
             self.status = "failed"
             self.message = f"Error: {str(e)}"
             print(f"Task {self.task_id} failed: {e}")
-        finally:
-            # Cleanup if stopped
-            if self._stop_flag:
-                self.status = "stopped"
-                self.message = "Task stopped by user"
+            
+            # Create empty results file to prevent download errors
+            empty_df = pd.DataFrame(columns=['name', 'rating', 'reviews', 'phone', 'industry', 
+                                             'full_address', 'website', 'google_maps_link', 'status'])
+            empty_df.to_csv(self.results_file, index=False)
     
-    def _run_poi_scraping(self):
-        """Run POI radius scraping simulation"""
-        self.message = "Starting POI scraping..."
-        results = []
+    def _run_poi_scraping_real(self):
+        """Run POI radius scraping with REAL Playwright"""
+        self.message = "Starting REAL POI scraping..."
+        print("Starting REAL POI scraping")
         
         # Get parameters from config
         poi_auto = self.config.get('auto_poi', True)
@@ -442,7 +568,7 @@ class ScrapingTask:
         lon = self.config.get('longitude', 77.594600)
         max_results = self.config.get('max_results', 200)
         scroll_delay = self.config.get('scroll_delay', 1.0)
-        mode = self.config.get('mode', 'fast')
+        mode = self.config.get('mode', 'fast')  # 'fast' or 'deep'
         
         # Determine POI list
         if poi_auto:
@@ -451,7 +577,7 @@ class ScrapingTask:
             poi_list = [x.strip() for x in manual_poi.split(",") if x.strip()]
         
         total_poi = len(poi_list)
-        all_results = []
+        all_dfs = []
         
         for idx, poi in enumerate(poi_list, start=1):
             if self._stop_flag:
@@ -460,88 +586,69 @@ class ScrapingTask:
             self.message = f"Scraping POI: {poi} ({idx}/{total_poi})"
             self.progress = (idx - 1) / total_poi * 0.5
             
-            # Simulate scraping for this POI
-            poi_results = self._simulate_scraping(20, f"POI: {poi}")
-            for result in poi_results:
-                result['poi_keyword'] = poi
+            query = f"{poi} near {lat},{lon}"
+            search_url = f"https://www.google.com/maps/search/{urllib.parse.quote_plus(query)}"
             
-            all_results.extend(poi_results)
+            print(f"Searching for: {query}")
+            print(f"Search URL: {search_url}")
             
-            # Save checkpoint
-            if all_results and idx % 2 == 0:
-                temp_df = pd.DataFrame(all_results)
+            if mode == 'fast':
+                df = self.scraper.scrape_cards_only(
+                    search_url=search_url,
+                    max_results=max_results,
+                    scroll_pause=scroll_delay,
+                )
+            else:
+                df = self.scraper.scrape_deep(
+                    search_url=search_url,
+                    max_results=max_results,
+                    scroll_pause=scroll_delay,
+                )
+            
+            if not df.empty:
+                df["poi_keyword"] = poi
+                all_dfs.append(df)
+            
+            # Save intermediate checkpoint
+            if all_dfs:
+                temp_df = pd.concat(all_dfs, ignore_index=True)
                 self.scraper.save_checkpoint(temp_df)
         
-        # Save final results
-        if all_results:
-            final_df = pd.DataFrame(all_results)
-            final_df.to_csv(self.results_file, index=False)
-            self.total_results = len(final_df)
-            self.scraper.save_checkpoint(final_df)
+        # Combine all results
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            final_df = final_df.drop_duplicates(subset=["google_maps_link"], keep="first")
+            return final_df
+        else:
+            return pd.DataFrame()
     
-    def _run_search_scraping(self):
-        """Run search query scraping simulation"""
-        self.message = "Starting search scraping..."
+    def _run_search_scraping_real(self):
+        """Run search query scraping with REAL Playwright"""
+        self.message = "Starting REAL search scraping..."
+        print("Starting REAL search scraping")
         
         # Get parameters from config
         search_url = self.config.get('search_url', '')
         max_results = self.config.get('max_results', 200)
+        scroll_delay = self.config.get('scroll_delay', 1.0)
+        mode = self.config.get('mode', 'fast')  # 'fast' or 'deep'
         
-        # Simulate scraping
-        results = self._simulate_scraping(max_results, "Search")
+        print(f"Search URL: {search_url}")
+        print(f"Max results: {max_results}")
+        print(f"Mode: {mode}")
         
-        if results:
-            final_df = pd.DataFrame(results)
-            final_df.to_csv(self.results_file, index=False)
-            self.total_results = len(final_df)
-            self.scraper.save_checkpoint(final_df)
-    
-    def _simulate_scraping(self, count, source_type):
-        """Simulate scraping with realistic timing"""
-        results = []
-        
-        for i in range(1, min(count, 150) + 1):
-            if self._stop_flag:
-                break
-            
-            time.sleep(0.1)  # Simulated work time
-            
-            # Update progress
-            self.progress = i / min(count, 150)
-            self.message = f"Scraping {source_type} result {i}/{min(count, 150)}"
-            
-            # Generate realistic-looking data
-            if source_type.startswith("POI"):
-                results.append({
-                    'name': f'POI Business {i}',
-                    'rating': round(3.5 + (i % 50) / 10, 1),
-                    'reviews': 10 + (i * 5) % 500,
-                    'phone': f'555-{1000+i:04d}',
-                    'industry': 'Education',
-                    'full_address': f'{i} Main St, City {i}',
-                    'website': f'https://poibusiness{i}.com',
-                    'google_maps_link': f'https://maps.google.com/?q=poibusiness{i}',
-                    'status': 'ok'
-                })
-            else:
-                results.append({
-                    'name': f'Search Result {i}',
-                    'rating': round(4.0 + (i % 40) / 10, 1),
-                    'reviews': 20 + (i * 3) % 1000,
-                    'phone': f'555-{2000+i:04d}',
-                    'industry': 'Training Institute',
-                    'full_address': f'{i+100} Search Ave, City {i}',
-                    'website': f'https://searchresult{i}.com',
-                    'google_maps_link': f'https://maps.google.com/?q=searchresult{i}',
-                    'status': 'ok'
-                })
-            
-            # Periodically save checkpoint
-            if i % 20 == 0 and results:
-                temp_df = pd.DataFrame(results)
-                self.scraper.save_checkpoint(temp_df)
-        
-        return results
+        if mode == 'fast':
+            return self.scraper.scrape_cards_only(
+                search_url=search_url,
+                max_results=max_results,
+                scroll_pause=scroll_delay,
+            )
+        else:
+            return self.scraper.scrape_deep(
+                search_url=search_url,
+                max_results=max_results,
+                scroll_pause=scroll_delay,
+            )
     
     def stop(self):
         """Stop the task"""
@@ -568,6 +675,7 @@ class ScrapingTask:
         if self.results_file and os.path.exists(self.results_file):
             return self.results_file
         return None
+
 class TaskManager:
     """Manages background scraping tasks"""
     
