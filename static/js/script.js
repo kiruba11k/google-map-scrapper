@@ -168,10 +168,16 @@ function pollTaskStatus(taskId, taskType) {
             
             if (taskType === 'poi') {
                 $('#poi-progress-bar').css('width', `${progress}%`).text(`${progress}%`);
-                $('#poi-progress-message').text(status.message);
+                $('#poi-progress-message').html(`
+                    <strong>${status.message}</strong><br>
+                    <small class="text-muted">Progress: ${progress}% | Results: ${status.total_results || 0}</small>
+                `);
             } else {
                 $('#search-progress-bar').css('width', `${progress}%`).text(`${progress}%`);
-                $('#search-progress-message').text(status.message);
+                $('#search-progress-message').html(`
+                    <strong>${status.message}</strong><br>
+                    <small class="text-muted">Progress: ${progress}% | Results: ${status.total_results || 0}</small>
+                `);
             }
             
             // Check if task is complete
@@ -190,30 +196,28 @@ function pollTaskStatus(taskId, taskType) {
                 loadRecoveryData();
                 
                 showNotification('Task completed successfully!', 'success');
-            } else if (status.status === 'failed' || status.status === 'stopped') {
+            } else if (status.status === 'failed') {
                 clearInterval(taskPollingIntervals[taskId]);
                 delete taskPollingIntervals[taskId];
                 delete activeTasks[taskId];
-                
-                if (status.status === 'failed') {
-                    showNotification('Task failed: ' + status.message, 'danger');
-                } else {
-                    showNotification('Task stopped by user', 'warning');
-                }
-                
                 updateActiveTasksBadge();
+                
+                showNotification('Task failed: ' + status.message, 'danger');
+            } else if (status.status === 'stopped') {
+                clearInterval(taskPollingIntervals[taskId]);
+                delete taskPollingIntervals[taskId];
+                delete activeTasks[taskId];
+                updateActiveTasksBadge();
+                
+                showNotification('Task stopped by user', 'warning');
             }
         },
-        error: function() {
-            // Error polling, task might be gone
-            clearInterval(taskPollingIntervals[taskId]);
-            delete taskPollingIntervals[taskId];
-            delete activeTasks[taskId];
-            updateActiveTasksBadge();
+        error: function(xhr, status, error) {
+            console.error('Polling error:', error);
+            // Don't clear interval on temporary errors, just log
         }
     });
 }
-
 function stopTask(taskId, taskType) {
     $.ajax({
         url: `/api/stop_task/${taskId}`,
